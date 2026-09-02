@@ -1,0 +1,158 @@
+{
+  "name": "pipeline1",
+  "properties": {
+    "parameters": {
+      "fileName": {
+        "type": "string"
+      }
+    },
+    "activities": [
+      {
+        "name": "Bronze",
+        "type": "Copy",
+        "dependsOn": [],
+        "inputs": [
+          {
+            "referenceName": "WeeklyCareLogsCsv",
+            "type": "DatasetReference",
+            "parameters": {
+              "fileName": {
+                "value": "@pipeline().parameters.fileName",
+                "type": "Expression"
+              }
+            }
+          }
+        ],
+        "outputs": [
+          {
+            "referenceName": "BronzeCareLogs",
+            "type": "DatasetReference"
+          }
+        ],
+        "typeProperties": {
+          "source": {
+            "type": "DelimitedTextSource"
+          },
+          "sink": {
+            "type": "AzureSqlSink",
+            "preCopyScript": {
+              "value": "@concat('DELETE FROM bronze.care_logs WHERE source_file = ''', pipeline().parameters.fileName, ''';')",
+              "type": "Expression"
+            }
+          }
+        }
+      },
+      {
+        "name": "Create Pipeline Audit Record",
+        "type": "SqlServerStoredProcedure",
+        "dependsOn": [
+          {
+            "activity": "Bronze",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "linkedServiceName": {
+          "referenceName": "AzureSqlDatabase",
+          "type": "LinkedServiceReference"
+        },
+        "typeProperties": {
+          "storedProcedureName": "[audit].[log_pipeline_run]",
+          "storedProcedureParameters": {
+            "source_file": {
+              "value": {
+                "value": "@pipeline().parameters.fileName",
+                "type": "Expression"
+              },
+              "type": "String"
+            },
+            "rows_received": {
+              "value": {
+                "value": "@activity('Bronze').output.rowsCopied",
+                "type": "Expression"
+              },
+              "type": "Int32"
+            },
+            "run_status": {
+              "value": "Succeeded",
+              "type": "String"
+            }
+          }
+        }
+      },
+      {
+        "name": "Bronze to Silver Log Event",
+        "type": "AzureFunctionActivity",
+        "dependsOn": [
+          {
+            "activity": "Create Pipeline Audit Record",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "linkedServiceName": {
+          "referenceName": "CareHomeAzureFunction",
+          "type": "LinkedServiceReference"
+        },
+        "typeProperties": {
+          "functionName": "load-bronze-to-silver-log-event",
+          "method": "POST",
+          "body": {
+            "value": "@concat('{\"source_file\":\"', pipeline().parameters.fileName, '\"}')",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "Log Event to Silver Tables",
+        "type": "AzureFunctionActivity",
+        "dependsOn": [
+          {
+            "activity": "Bronze to Silver Log Event",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "linkedServiceName": {
+          "referenceName": "CareHomeAzureFunction",
+          "type": "LinkedServiceReference"
+        },
+        "typeProperties": {
+          "functionName": "load-silver-log-event-to-silver-tables",
+          "method": "POST",
+          "body": {
+            "value": "@concat('{\"source_file\":\"', pipeline().parameters.fileName, '\"}')",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "Silver Tables to Gold",
+        "type": "AzureFunctionActivity",
+        "dependsOn": [
+          {
+            "activity": "Log Event to Silver Tables",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "linkedServiceName": {
+          "referenceName": "CareHomeAzureFunction",
+          "type": "LinkedServiceReference"
+        },
+        "typeProperties": {
+          "functionName": "load-silver-tables-to-gold",
+          "method": "POST",
+          "body": {
+            "value": "@concat('{\"source_file\":\"', pipeline().parameters.fileName, '\"}')",
+            "type": "Expression"
+          }
+        }
+      }
+    ]
+  }
+}

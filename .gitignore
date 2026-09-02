@@ -1,0 +1,32 @@
+# Azure Functions and Python
+local.settings.json
+.python_packages/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environment files and credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+~$*
+
+# Generated or private data
+data/raw/
+data/processed/
+*.pbix
+
+# Build output
+dist/
+build/
+*.zip
+*.log

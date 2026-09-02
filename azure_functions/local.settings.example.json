@@ -1,0 +1,10 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "SQL_CONNECTION_STRING": "Server=tcp:<server-name>.database.windows.net,1433;Database=<database-name>;UID=<sql-user>;PWD=<sql-password>;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;",
+    "VALID_RESIDENT_IDS": "R01,R02,R03,R04,R05,R06,R07",
+    "VALID_LOGGED_BY": "Manager 01,Staff 01,Staff 02,Staff 03,Staff 04,Staff 05"
+  }
+}
