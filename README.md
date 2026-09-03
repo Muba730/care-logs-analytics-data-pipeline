@@ -52,7 +52,7 @@ care-logs-analytics-data-pipeline/
 │   ├── adf_pipeline_overview.png
 │   └── pipeline1.reference.json
 ├── sql/
-│   ├── schema/
+│   ├── ddl_statement/
 │   │   ├── 01_bronze.sql
 │   │   ├── 02_audit.sql
 │   │   ├── 03_silver.sql
@@ -107,11 +107,11 @@ Each endpoint expects:
 
 For a new database, run the scripts in this order:
 
-1. `sql/schema/01_bronze.sql`
-2. `sql/schema/02_audit.sql`
-3. `sql/schema/03_silver.sql`
-4. `sql/schema/04_gold_dimensions.sql`
-5. `sql/schema/05_gold_facts.sql`
+1. `sql/ddl_statement/01_bronze.sql`
+2. `sql/ddl_statement/02_audit.sql`
+3. `sql/ddl_statement/03_silver.sql`
+4. `sql/ddl_statement/04_gold_dimensions.sql`
+5. `sql/ddl_statement/05_gold_facts.sql`
 
 The Gold loader seeds the date, resident, staff and log-type dimensions before
 loading the reporting tables.
