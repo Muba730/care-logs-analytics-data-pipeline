@@ -2,8 +2,9 @@
 
 An end-to-end Azure data engineering portfolio project that turns weekly synthetic care-home logs into validated reporting tables and a Power BI management dashboard.
 
-> **Live dashboard:** [Open the Power BI report](https://app.powerbi.com/view?r=eyJrIjoiZGNlYWVkNWUtMGIwNC00ZGNlLThhMTEtN2ZjZTkyY2Y1MzI4IiwidCI6ImNiYTc0NDM4LTI0NGYtNDk3Yy04Y2Y3LTI1Mzg3N2QyNjhmYiJ9)   ·   **Code:** [GitHub repository](https://github.com/Muba730/care-logs-analytics-data-pipeline)
-> Built on synthetic data. No real care records are used anywhere in this project.
+> **Live dashboard:** [Open the Power BI report](https://app.powerbi.com/view?r=eyJrIjoiZGNlYWVkNWUtMGIwNC00ZGNlLThhMTEtN2ZjZTkyY2Y1MzI4IiwidCI6ImNiYTc0NDM4LTI0NGYtNDk3Yy04Y2Y3LTI1Mzg3N2QyNjhmYiJ9)   
+   **Code:** [GitHub repository](https://github.com/Muba730/care-logs-analytics-data-pipeline)
+>  Built on synthetic data. No real care records are used anywhere in this project.
 
 ## Project background
 
