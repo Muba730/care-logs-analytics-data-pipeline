@@ -207,7 +207,7 @@ Changes in mood, communication, medication and incidents were sometimes linked r
 
 R01 had recurring episodes in January, April, July and October. Each one usually went from low mood and reduced communication to medication refusal and then an incident. Refusals went from one in January to two in April and three in July, each followed by a bookmarked management record. The major incidents in January and July led to care team involvement; the minor incidents in April and October were handled with one-to-one support. Seeing these records together helps a manager spot the pattern earlier.
 
-| **Signal** | **January**<br>Weeks 3–5 | **April**<br>Weeks 14–16 | **July**<br>Weeks 28–30 | **October**<br>Weeks 41–43 |
+| **Signal** | **January**<br>Weeks 3-5 | **April**<br>Weeks 14-16 | **July**<br>Weeks 28-30 | **October**<br>Weeks 41-43 |
 | --- | --- | --- | --- | --- |
 | Mood | Low | Low | Low | Low |
 | Communication | Minimal | Minimal / none | Minimal | Minimal |
