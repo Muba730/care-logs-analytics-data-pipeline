@@ -132,28 +132,70 @@ After the Bronze copy, a stored procedure writes a row to `audit.pipeline_run` w
 
 # Data Cleaning and Transformation
 
-I used Python in Azure Functions to clean the weekly care logs and prepare them for reporting. Each run processes only the current source file, while the original records remain in Bronze for traceability.
+I used Python in Azure Functions to clean the weekly care logs and prepare them for reporting. The Silver stage checks and standardises each record; the Gold stage uses pandas to build the summary tables Power BI reads.
 
-**Cleaning and standardising the records**
+**Cleaning and standardising**
 
-The synthetic dataset follows controlled app options, so cleaning focused on formatting, data types and validation. Examples of the implemented rules include:
+| **Task** | **Example** |
+| --- | --- |
+| Clean descriptions | Replace repeated spaces, tabs and line breaks with single spaces |
+| Convert timestamps | Parse `03/01/2025 22:14` as a datetime, reading the day before the month |
+| Standardise staff names | Convert `staff2` to `Staff 02` |
+| Convert flags | Turn values such as `Yes` and `True` into Boolean fields |
+| Split the generic value columns | Move `amount_1` and `amount_2` into named fields such as appointment status and medication outcome |
 
-| **Task** | **Example** | **Purpose** |
-| --- | --- | --- |
-| Clean descriptions | Remove leading spaces and replace repeated spaces, tabs and line breaks with single spaces | Make notes easier to read without changing their wording |
-| Convert timestamps | Parse `03/01/2025 22:14` into a datetime value | Allow accurate sorting and grouping |
-| Standardise staff names | Convert `staff2` to `Staff 02` | Keep staff identifiers consistent |
-| Convert flags | Convert values such as `Yes` and `True` into Boolean fields | Apply consistent filtering for bookmarked and deleted records |
+```python
+def normalise_staff_name(value):
+    text = clean_text(value)
+    match = re.fullmatch(r"staff\s*0*(\d+)", text, flags=re.IGNORECASE)
+    if match:
+        return f"Staff {int(match.group(1)):02d}"
+    return text
+```
 
-Deleted records are excluded from Silver, and source log IDs are checked within each file to prevent duplicate loading. The validated records are then transformed into the summaries and event tables needed for reporting.
+Deleted and duplicate records are excluded, and each week can be reloaded without creating duplicates.
+
+**Validating the records**
+
+Records are checked against required fields, a controlled list of residents and staff, and rules that depend on other fields in the same record:
+
+```python
+if record["category"] == "Health Visit":
+    if record["amount_one_key"] != "appointment_status":
+        errors.append("Health Visit is missing appointment_status")
+    elif record["amount_1"] not in APPOINTMENT_STATUSES:
+        errors.append("Unknown appointment status")
+```
+
+Anything that fails is written to an exception table with the field, its original value and the reason, then kept out of the reporting tables. The run is marked as completed with issues, so failed records stay visible and traceable instead of being dropped quietly.
 
 **Transforming records for reporting**
 
-- **Mood and communication:** Map labels to scores—1–5 for mood and 1–4 for communication—then calculate daily averages and log counts by resident. For example, `Minimal`, `Minimal` and `Normal` produce an average communication score of **2.33**. Days without entries retain a zero log count and a blank average, distinguishing missing information from low wellbeing.
-- **Medication:** Extract outcomes and medication rounds into named fields, then aggregate accepted, refused and PRN dose counts by resident and week. Power BI uses the accepted and refused totals to calculate adherence: **accepted ÷ (accepted + refused) × 100**.
-- **Appointments:** Extract scheduled dates, times and staff-support requirements. The prototype applies a 90-minute duration to bookings and flags overlapping staff-supported appointments within each weekly batch. Bookings are reported against their scheduled date; completion and cancellation logs remain separate events.
-- **Incidents:** Retain one record per incident, including its resident, date, type and description. Power BI can then count incidents across different periods while preserving the underlying details.
-- **Bookmarked notes:** Filter bookmarked records into a dedicated Gold table, retaining the cleaned note, resident, timestamp, staff member and source reference. This supplies the Important Logs view and keeps concerns and follow-up actions available as separate, chronological records.
+- **Wellbeing:** Mood and communication labels are mapped to scores (1–5 and 1–4) and grouped into daily averages by resident. Every resident has a row for every day, so a day with no entry shows as missing rather than as a low score.
+- **Medication:** Accepted, refused and PRN doses are counted each week and compared against the median of the resident's previous 12 weeks, showing whether their intake has changed.
+- **Appointments:** Scheduled times are extracted and staff-supported bookings are compared against each other to flag overlaps, so managers can arrange cover in advance.
+- **Incidents and bookmarked notes:** Kept as individual records with their detail intact, so managers can count them over time and still read the original note.
+
+```python
+# Daily log counts by resident
+grouped = (
+    working.groupby(["log_date", "resident_id", "category", "item"])
+    .agg(log_count=("log_event_key", "size"),
+         bookmarked_log_count=("bookmark_count", "sum"))
+    .reset_index()
+)
+
+# Medication baseline from the resident's previous 12 weeks
+previous_values = resident_history["accepted_dose_count"].tail(12)
+if len(previous_values) >= 4:
+    baseline_value = round(float(median(previous_values)), 2)
+    percentage_of_baseline = round(accepted_count / baseline_value * 100, 2)
+
+# Overlapping staff-supported appointments
+overlaps = first["start"] < second["end"] and second["start"] < first["end"]
+```
+
+The full loaders are in the [repository](https://github.com/Muba730/care-logs-analytics-data-pipeline/tree/main/azure_functions).
 
 # Power BI report
 
