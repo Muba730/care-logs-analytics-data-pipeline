@@ -1,9 +1,9 @@
 """Loads one validated Silver file into the Gold reporting tables."""
 
 from datetime import date, datetime, timedelta
-from statistics import median
 
 import pandas as pd
+from sqlalchemy import inspect, text
 
 
 REPORT_START = date(2024, 12, 30)
@@ -68,6 +68,126 @@ CONTROLLED_LOG_TYPES = (
 )
 
 
+
+
+
+FACT_COLUMNS = {
+    "agg_log_count_daily": [
+        "date_key",
+        "resident_key",
+        "staff_key",
+        "log_type_key",
+        "shift_type",
+        "log_count",
+        "bookmarked_log_count",
+        "source_file"
+    ],
+    "fact_mood_daily": [
+        "date_key",
+        "resident_key",
+        "mood_log_count",
+        "expected_log_count",
+        "missing_log_count",
+        "very_low_count",
+        "low_count",
+        "okay_count",
+        "good_count",
+        "very_good_count",
+        "average_mood_score",
+        "minimum_mood_score",
+        "requires_review",
+        "source_file"
+    ],
+    "fact_communication": [
+        "date_key",
+        "resident_key",
+        "day_log_count",
+        "night_log_count",
+        "total_log_count",
+        "expected_log_count",
+        "missing_log_count",
+        "no_response_count",
+        "minimal_count",
+        "normal_count",
+        "expansive_count",
+        "average_communication",
+        "requires_review",
+        "source_file"
+    ],
+    "fact_medication": [
+        "week_start_date_key",
+        "resident_key",
+        "total_dose_count",
+        "accepted_dose_count",
+        "refused_dose_count",
+        "prn_dose_count",
+        "has_baseline",
+        "baseline_median_doses",
+        "percentage_of_baseline",
+        "requires_review",
+        "source_file"
+    ],
+    "fact_appointment": [
+        "appointment_date_key",
+        "resident_key",
+        "appointment_type",
+        "appointment_status",
+        "scheduled_start_datetime",
+        "scheduled_end_datetime",
+        "staff_required",
+        "completed",
+        "has_conflict",
+        "source_log_event_key",
+        "source_file"
+    ],
+    "fact_incident": [
+        "date_key",
+        "resident_key",
+        "staff_key",
+        "incident_type",
+        "incident_detail",
+        "incident_datetime",
+        "shift_type",
+        "witnessed_by",
+        "description_clean",
+        "bookmarked",
+        "source_log_event_key",
+        "source_file"
+    ],
+    "fact_staff_shift": [
+        "date_key",
+        "staff_key",
+        "shift_type",
+        "first_log_datetime",
+        "last_log_datetime",
+        "log_count",
+        "resident_count",
+        "source_file"
+    ],
+    "fact_staff_involvement": [
+        "date_key",
+        "resident_key",
+        "staff_key",
+        "involvement_type",
+        "involvement_detail",
+        "source_log_event_key",
+        "source_file"
+    ],
+    "fact_flagged_log": [
+        "date_key",
+        "resident_key",
+        "staff_key",
+        "log_type_key",
+        "source_log_event_key",
+        "logged_at",
+        "shift_type",
+        "title",
+        "description_clean",
+        "source_file"
+    ]
+}
+
+
 def clean_text(value):
     if value is None or (not isinstance(value, str) and pd.isna(value)):
         return None
@@ -108,12 +228,6 @@ def make_date_key(value):
     return int(value.strftime("%Y%m%d"))
 
 
-def fetch_dataframe(cursor, query, parameters=()):
-    cursor.execute(query, parameters)
-    column_names = [column[0] for column in cursor.description]
-    return pd.DataFrame.from_records(cursor.fetchall(), columns=column_names)
-
-
 def normalise_dates(frame, date_columns=(), datetime_columns=()):
     for column_name in date_columns:
         if column_name in frame.columns:
@@ -130,155 +244,95 @@ def normalise_dates(frame, date_columns=(), datetime_columns=()):
     return frame
 
 
-def seed_date_dimension(cursor):
-    rows = []
-    current_date = CALENDAR_START
+def read_frame(connection, query, parameters=None):
+    return pd.read_sql(text(query), connection, params=parameters or {})
 
-    while current_date <= CALENDAR_END:
-        day_number = current_date.weekday() + 1
-        week_start_date = current_date - timedelta(days=current_date.weekday())
-        week_end_date = week_start_date + timedelta(days=6)
 
-        reporting_week_number = None
-        if REPORT_START <= current_date <= REPORT_END:
-            reporting_week_number = (
-                (current_date - REPORT_START).days // 7
-            ) + 1
-
-        rows.append(
-            (
-                make_date_key(current_date),
-                current_date,
-                current_date.strftime("%A"),
-                day_number,
-                day_number in {6, 7},
-                week_start_date,
-                week_end_date,
-                current_date.isocalendar().week,
-                reporting_week_number,
-                current_date.month,
-                current_date.strftime("%B"),
-                ((current_date.month - 1) // 3) + 1,
-                current_date.year,
-            )
-        )
-        current_date += timedelta(days=1)
-
-    cursor.executemany(
-        """
-        INSERT INTO gold.dim_date (
-            date_key,
-            full_date,
-            day_name,
-            day_of_week_number,
-            is_weekend,
-            week_start_date,
-            week_end_date,
-            iso_week_number,
-            reporting_week_number,
-            month_number,
-            month_name,
-            quarter_number,
-            calendar_year
-        )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM gold.dim_date
-            WHERE full_date = ?
-        );
-        """,
-        [row + (row[1],) for row in rows],
+def append_frame(connection, table_name, frame):
+    """Append to an existing DDL-managed table, inside the caller's transaction."""
+    if frame.empty:
+        return 0
+    if not inspect(connection).has_table(table_name, schema="gold"):
+        raise ValueError(f"Create gold.{table_name} using the SQL DDL first")
+    frame.to_sql(
+        name=table_name,
+        schema="gold",
+        con=connection,
+        if_exists="append",
+        index=False,
+        chunksize=500,
     )
+    return len(frame)
 
 
-def seed_resident_dimension(cursor):
-    cursor.executemany(
-        """
-        INSERT INTO gold.dim_resident (
-            resident_id,
-            resident_name
-        )
-        SELECT ?, ?
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM gold.dim_resident
-            WHERE resident_id = ?
-        );
-        """,
-        [row + (row[0],) for row in RESIDENTS],
+def seed_missing_dimension(connection, table_name, frame, keys):
+    existing = read_frame(
+        connection, f"SELECT {', '.join(keys)} FROM gold.{table_name}"
     )
-
-
-def seed_staff_dimension(cursor):
-    cursor.executemany(
-        """
-        INSERT INTO gold.dim_staff (
-            staff_id,
-            staff_role,
-            is_support_worker
-        )
-        SELECT ?, ?, ?
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM gold.dim_staff
-            WHERE staff_id = ?
-        );
-        """,
-        [row + (row[0],) for row in STAFF],
+    if "full_date" in keys:
+        existing = normalise_dates(existing, date_columns=("full_date",))
+    missing = frame.merge(
+        existing, on=keys, how="left", indicator=True, validate="one_to_one"
     )
+    missing = missing.loc[missing["_merge"] == "left_only", frame.columns]
+    append_frame(connection, table_name, missing)
 
 
-def seed_log_type_dimension(cursor):
-    rows = [
-        (category, item, f"{category} - {item}", category, item)
-        for category, item in CONTROLLED_LOG_TYPES
-    ]
-
-    cursor.executemany(
-        """
-        INSERT INTO gold.dim_log_type (
-            category,
-            item,
-            log_type_name
-        )
-        SELECT ?, ?, ?
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM gold.dim_log_type
-            WHERE category = ?
-              AND item = ?
-        );
-        """,
-        rows,
+def seed_dimensions(connection):
+    dates = pd.Series(pd.date_range(CALENDAR_START, CALENDAR_END))
+    week_starts = dates - pd.to_timedelta(dates.dt.dayofweek, unit="D")
+    reporting_week = ((dates - pd.Timestamp(REPORT_START)).dt.days // 7 + 1)
+    reporting_week = reporting_week.where(
+        dates.between(pd.Timestamp(REPORT_START), pd.Timestamp(REPORT_END))
+    ).astype("Int64")
+    date_frame = pd.DataFrame({
+        "date_key": dates.dt.strftime("%Y%m%d").astype(int),
+        "full_date": dates.dt.date,
+        "day_name": dates.dt.day_name(),
+        "day_of_week_number": dates.dt.dayofweek + 1,
+        "is_weekend": dates.dt.dayofweek >= 5,
+        "week_start_date": week_starts.dt.date,
+        "week_end_date": (week_starts + pd.Timedelta(days=6)).dt.date,
+        "iso_week_number": dates.dt.isocalendar().week,
+        "reporting_week_number": reporting_week,
+        "month_number": dates.dt.month,
+        "month_name": dates.dt.month_name(),
+        "quarter_number": dates.dt.quarter,
+        "calendar_year": dates.dt.year,
+    })
+    resident_frame = pd.DataFrame(RESIDENTS, columns=["resident_id", "resident_name"])
+    staff_frame = pd.DataFrame(
+        STAFF, columns=["staff_id", "staff_role", "is_support_worker"]
     )
+    log_types = pd.DataFrame(CONTROLLED_LOG_TYPES, columns=["category", "item"])
+    log_types["log_type_name"] = log_types["category"] + " - " + log_types["item"]
+    for table_name, frame, keys in (
+        ("dim_date", date_frame, ["full_date"]),
+        ("dim_resident", resident_frame, ["resident_id"]),
+        ("dim_staff", staff_frame, ["staff_id"]),
+        ("dim_log_type", log_types, ["category", "item"]),
+    ):
+        seed_missing_dimension(connection, table_name, frame, keys)
 
 
-def seed_dimensions(cursor):
-    seed_date_dimension(cursor)
-    seed_resident_dimension(cursor)
-    seed_staff_dimension(cursor)
-    seed_log_type_dimension(cursor)
-
-
-def load_dimension_maps(cursor):
-    date_frame = fetch_dataframe(
-        cursor,
+def load_dimension_maps(connection):
+    date_frame = read_frame(
+        connection,
         "SELECT date_key, full_date FROM gold.dim_date;",
     )
     date_frame = normalise_dates(date_frame, date_columns=("full_date",))
     date_map = dict(zip(date_frame["full_date"], date_frame["date_key"]))
 
-    resident_frame = fetch_dataframe(
-        cursor,
+    resident_frame = read_frame(
+        connection,
         "SELECT resident_key, resident_id FROM gold.dim_resident;",
     )
     resident_map = dict(
         zip(resident_frame["resident_id"], resident_frame["resident_key"])
     )
 
-    staff_frame = fetch_dataframe(
-        cursor,
+    staff_frame = read_frame(
+        connection,
         """
         SELECT staff_key, staff_id, is_support_worker
         FROM gold.dim_staff;
@@ -291,8 +345,8 @@ def load_dimension_maps(cursor):
         if as_boolean(row.is_support_worker)
     }
 
-    log_type_frame = fetch_dataframe(
-        cursor,
+    log_type_frame = read_frame(
+        connection,
         """
         SELECT log_type_key, category, item
         FROM gold.dim_log_type;
@@ -320,11 +374,11 @@ def required_key(mapping, natural_key, dimension_name):
     return int(mapping[natural_key])
 
 
-def load_silver_frames(cursor, source_file):
+def load_silver_frames(connection, source_file):
     frames = {}
 
-    frames["log_event"] = fetch_dataframe(
-        cursor,
+    frames["log_event"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -341,13 +395,13 @@ def load_silver_frames(cursor, source_file):
             week_start_date,
             source_file
         FROM silver.log_event
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["activity"] = fetch_dataframe(
-        cursor,
+    frames["activity"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -360,13 +414,13 @@ def load_silver_frames(cursor, source_file):
             logged_by,
             source_file
         FROM silver.activity
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["appointment"] = fetch_dataframe(
-        cursor,
+    frames["appointment"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -382,13 +436,13 @@ def load_silver_frames(cursor, source_file):
             logged_by,
             source_file
         FROM silver.appointment
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["communication"] = fetch_dataframe(
-        cursor,
+    frames["communication"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -401,13 +455,13 @@ def load_silver_frames(cursor, source_file):
             logged_by,
             source_file
         FROM silver.communication
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["incident"] = fetch_dataframe(
-        cursor,
+    frames["incident"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -423,13 +477,13 @@ def load_silver_frames(cursor, source_file):
             bookmark,
             source_file
         FROM silver.incident
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["medication"] = fetch_dataframe(
-        cursor,
+    frames["medication"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -442,13 +496,13 @@ def load_silver_frames(cursor, source_file):
             logged_by,
             source_file
         FROM silver.medication
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["mood"] = fetch_dataframe(
-        cursor,
+    frames["mood"] = read_frame(
+        connection,
         """
         SELECT
             log_event_key,
@@ -461,13 +515,13 @@ def load_silver_frames(cursor, source_file):
             logged_by,
             source_file
         FROM silver.mood
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
-    frames["staff_shift"] = fetch_dataframe(
-        cursor,
+    frames["staff_shift"] = read_frame(
+        connection,
         """
         SELECT
             staff_name,
@@ -478,9 +532,9 @@ def load_silver_frames(cursor, source_file):
             log_count,
             source_file
         FROM silver.staff_shift
-        WHERE source_file = ?;
+        WHERE source_file = :source_file;
         """,
-        (source_file,),
+        {"source_file": source_file},
     )
 
     frames["log_event"] = normalise_dates(
@@ -584,298 +638,217 @@ def validate_silver_source(frames, source_file):
     return week_starts[0]
 
 
-def delete_previous_gold_load(cursor, source_file):
-    # Replacing one source-file batch makes reruns safe.
-    for table_name in (
-        "gold.agg_log_count_daily",
-        "gold.fact_mood_daily",
-        "gold.fact_communication",
-        "gold.fact_medication",
-        "gold.fact_appointment",
-        "gold.fact_incident",
-        "gold.fact_staff_shift",
-        "gold.fact_staff_involvement",
-        "gold.fact_flagged_log",
-    ):
-        cursor.execute(
-            f"DELETE FROM {table_name} WHERE source_file = ?",
-            (source_file,),
+def delete_previous_gold_load(connection, source_file):
+    for table_name in FACT_COLUMNS:
+        connection.execute(
+            text(f"DELETE FROM gold.{table_name} WHERE source_file = :source_file"),
+            {"source_file": source_file},
         )
 
 
-def build_log_count_rows(events, maps, source_file):
-    working = events.copy()
-    working["bookmark_count"] = working["bookmark"].map(as_boolean).astype(int)
+def add_dimension_keys(frame, maps, date_column="log_date", staff_column=None,
+                       log_type=False):
+    frame = frame.copy()
+    mappings = [(date_column, "date_key", maps["date"])]
+    if "resident_id" in frame.columns:
+        mappings.append(("resident_id", "resident_key", maps["resident"]))
+    if staff_column is not None:
+        mappings.append((staff_column, "staff_key", maps["staff"]))
+    if log_type:
+        frame["_log_type"] = list(zip(frame["category"], frame["item"]))
+        mappings.append(("_log_type", "log_type_key", maps["log_type"]))
+    for source_column, key_column, mapping in mappings:
+        values = frame[source_column].map(mapping)
+        if values.isna().any():
+            missing = frame.loc[values.isna(), source_column].tolist()
+            raise ValueError(f"No {key_column} found for {missing!r}")
+        frame[key_column] = values.astype("int64")
+    return frame
 
-    grouped = (
-        working.groupby(
-            [
-                "log_date",
-                "resident_id",
-                "logged_by",
-                "category",
-                "item",
-                "shift_type",
-            ],
-            dropna=False,
-        )
-        .agg(
-            log_count=("log_event_key", "size"),
-            bookmarked_log_count=("bookmark_count", "sum"),
-        )
-        .reset_index()
+
+def fact_frame(frame, table_name, source_file):
+    frame = frame.copy()
+    frame["source_file"] = source_file
+    return frame.loc[:, FACT_COLUMNS[table_name]]
+
+
+def build_log_count_frame(events, maps, source_file):
+    working = events.assign(
+        bookmark_count=events["bookmark"].map(as_boolean).astype(int)
     )
-
-    rows = []
-    for row in grouped.itertuples(index=False):
-        rows.append(
-            (
-                required_key(maps["date"], row.log_date, "date"),
-                required_key(
-                    maps["resident"], row.resident_id, "resident"
-                ),
-                required_key(maps["staff"], row.logged_by, "staff"),
-                required_key(
-                    maps["log_type"],
-                    (row.category, row.item),
-                    "log type",
-                ),
-                row.shift_type,
-                int(row.log_count),
-                int(row.bookmarked_log_count),
-                source_file,
-            )
-        )
-
-    return rows
+    grouped = working.groupby(
+        ["log_date", "resident_id", "logged_by", "category", "item", "shift_type"],
+        dropna=False,
+    ).agg(
+        log_count=("log_event_key", "size"),
+        bookmarked_log_count=("bookmark_count", "sum"),
+    ).reset_index()
+    grouped = add_dimension_keys(grouped, maps, staff_column="logged_by", log_type=True)
+    return fact_frame(grouped, "agg_log_count_daily", source_file)
 
 
-def build_mood_rows(mood, maps, source_file, week_start_date):
-    score_groups = {}
-    if not mood.empty:
-        score_groups = (
-            mood.groupby(["resident_id", "log_date"])["mood_score"]
-            .apply(lambda values: [int(value) for value in values])
-            .to_dict()
-        )
-
-    rows = []
-    for resident_id, _ in RESIDENTS:
-        for day_offset in range(7):
-            log_date = week_start_date + timedelta(days=day_offset)
-            scores = score_groups.get((resident_id, log_date), [])
-            score_counts = {score: scores.count(score) for score in range(1, 6)}
-            log_count = len(scores)
-            missing_count = max(0, EXPECTED_DAILY_LOGS - log_count)
-            average_score = round(sum(scores) / log_count, 2) if scores else None
-            minimum_score = min(scores) if scores else None
-
-            # This is the daily signal. Cross-day deterioration is calculated
-            # later over the daily rows in Power BI.
-            requires_review = score_counts[1] >= 1 or (
-                score_counts[1] + score_counts[2] >= 2
-            )
-
-            rows.append(
-                (
-                    required_key(maps["date"], log_date, "date"),
-                    required_key(
-                        maps["resident"], resident_id, "resident"
-                    ),
-                    log_count,
-                    EXPECTED_DAILY_LOGS,
-                    missing_count,
-                    score_counts[1],
-                    score_counts[2],
-                    score_counts[3],
-                    score_counts[4],
-                    score_counts[5],
-                    average_score,
-                    minimum_score,
-                    requires_review,
-                    source_file,
-                )
-            )
-
-    return rows
-
-
-def build_communication_rows(
-    communication,
-    maps,
-    source_file,
-    week_start_date,
-):
-    grouped = {}
-    if not communication.empty:
-        for (resident_id, log_date), group in communication.groupby(
-            ["resident_id", "log_date"]
-        ):
-            scores = [int(value) for value in group["communication_score"]]
-            grouped[(resident_id, log_date)] = {
-                "scores": scores,
-                "day_count": int((group["shift_type"] == "Day").sum()),
-                "night_count": int((group["shift_type"] == "Night").sum()),
-            }
-
-    rows = []
-    for resident_id, _ in RESIDENTS:
-        for day_offset in range(7):
-            log_date = week_start_date + timedelta(days=day_offset)
-            values = grouped.get(
-                (resident_id, log_date),
-                {"scores": [], "day_count": 0, "night_count": 0},
-            )
-            scores = values["scores"]
-            score_counts = {score: scores.count(score) for score in range(1, 5)}
-            total_count = len(scores)
-            missing_count = max(0, EXPECTED_DAILY_LOGS - total_count)
-            average_score = (
-                round(sum(scores) / total_count, 2) if scores else None
-            )
-            requires_review = total_count == 0 or (
-                score_counts[1] + score_counts[2] >= 2
-            )
-
-            rows.append(
-                (
-                    required_key(maps["date"], log_date, "date"),
-                    required_key(
-                        maps["resident"], resident_id, "resident"
-                    ),
-                    values["day_count"],
-                    values["night_count"],
-                    total_count,
-                    EXPECTED_DAILY_LOGS,
-                    missing_count,
-                    score_counts[1],
-                    score_counts[2],
-                    score_counts[3],
-                    score_counts[4],
-                    average_score,
-                    requires_review,
-                    source_file,
-                )
-            )
-
-    return rows
-
-
-def fetch_medication_history(cursor, current_week_start):
-    history = fetch_dataframe(
-        cursor,
-        """
-        SELECT
-            resident.resident_id,
-            calendar.full_date AS week_start_date,
-            medication.accepted_dose_count
-        FROM gold.fact_medication AS medication
-        JOIN gold.dim_resident AS resident
-          ON resident.resident_key = medication.resident_key
-        JOIN gold.dim_date AS calendar
-          ON calendar.date_key = medication.week_start_date_key
-        WHERE calendar.full_date < ?
-        ORDER BY
-            resident.resident_id,
-            calendar.full_date;
-        """,
-        (current_week_start,),
+def daily_score_frame(frame, score_column, score_names, week_start_date):
+    """Include all seven residents and all seven days, even when logs are absent."""
+    working = frame.copy()
+    working[score_column] = pd.to_numeric(working[score_column], errors="raise")
+    aggregations = {
+        "log_count": (score_column, "size"),
+        "average_score": (score_column, "mean"),
+        "minimum_score": (score_column, "min"),
+    }
+    for score, name in enumerate(score_names, start=1):
+        working[name] = working[score_column].eq(score).astype(int)
+        aggregations[name] = (name, "sum")
+    count_columns = ["log_count", *score_names]
+    if score_column == "communication_score":
+        working["day_log_count"] = working["shift_type"].eq("Day").astype(int)
+        working["night_log_count"] = working["shift_type"].eq("Night").astype(int)
+        for name in ("day_log_count", "night_log_count"):
+            aggregations[name] = (name, "sum")
+            count_columns.append(name)
+    grouped = working.groupby(["resident_id", "log_date"]).agg(**aggregations)
+    grid = pd.MultiIndex.from_product(
+        [[resident for resident, _ in RESIDENTS],
+         pd.date_range(week_start_date, periods=7).date],
+        names=["resident_id", "log_date"],
     )
-    return normalise_dates(history, date_columns=("week_start_date",))
+    daily = grouped.reindex(grid).reset_index()
+    daily[count_columns] = daily[count_columns].fillna(0).astype(int)
+    daily["expected_log_count"] = EXPECTED_DAILY_LOGS
+    daily["missing_log_count"] = (EXPECTED_DAILY_LOGS - daily["log_count"]).clip(lower=0)
+    daily["average_score"] = daily["average_score"].round(2)
+    return daily
 
 
-def build_medication_rows(
-    medication,
-    history,
-    maps,
-    source_file,
-):
+def build_mood_frame(mood, maps, source_file, week_start_date):
+    daily = daily_score_frame(
+        mood, "mood_score",
+        ["very_low_count", "low_count", "okay_count", "good_count", "very_good_count"],
+        week_start_date,
+    )
+    daily["requires_review"] = daily["very_low_count"].ge(1) | (
+        daily["very_low_count"] + daily["low_count"]
+    ).ge(2)
+    daily = daily.rename(columns={
+        "log_count": "mood_log_count",
+        "average_score": "average_mood_score",
+        "minimum_score": "minimum_mood_score",
+    })
+    return fact_frame(add_dimension_keys(daily, maps), "fact_mood_daily", source_file)
+
+
+def build_communication_frame(communication, maps, source_file, week_start_date):
+    daily = daily_score_frame(
+        communication, "communication_score",
+        ["no_response_count", "minimal_count", "normal_count", "expansive_count"],
+        week_start_date,
+    )
+    daily["requires_review"] = daily["log_count"].eq(0) | (
+        daily["no_response_count"] + daily["minimal_count"]
+    ).ge(2)
+    daily = daily.rename(columns={
+        "log_count": "total_log_count", "average_score": "average_communication"
+    })
+    return fact_frame(add_dimension_keys(daily, maps), "fact_communication", source_file)
+
+
+def build_medication_frame(medication, maps, source_file):
     if medication.empty:
-        return []
-
-    statuses = set(medication["medication_status"].dropna())
-    unexpected_statuses = sorted(statuses - {"Accepted", "Refused"})
-    if unexpected_statuses:
-        raise ValueError(
-            f"Unexpected medication statuses in Silver: {unexpected_statuses}"
-        )
-    if medication["medication_status"].isna().any():
-        raise ValueError("A Silver medication row is missing medication_status")
-
-    rows = []
-    for (resident_id, week_start_date), group in medication.groupby(
-        ["resident_id", "week_start_date"]
-    ):
-        total_count = len(group)
-        accepted_count = int((group["medication_status"] == "Accepted").sum())
-        refused_count = int((group["medication_status"] == "Refused").sum())
-        prn_count = int(
-            group["medication_round"]
-            .fillna("")
-            .astype(str)
-            .str.upper()
-            .eq("PRN")
-            .sum()
-        )
-
-        previous_values = []
-        if not history.empty:
-            resident_history = history[
-                history["resident_id"] == resident_id
-            ].sort_values("week_start_date")
-            previous_values = [
-                int(value)
-                for value in resident_history["accepted_dose_count"].tail(
-                    MEDICATION_BASELINE_MAX_WEEKS
-                )
-            ]
-
-        has_baseline = len(previous_values) >= MEDICATION_BASELINE_MIN_WEEKS
-        baseline_value = None
-        percentage_of_baseline = None
-        if has_baseline:
-            baseline_value = round(float(median(previous_values)), 2)
-            if baseline_value > 0:
-                percentage_of_baseline = round(
-                    accepted_count / baseline_value * 100,
-                    2,
-                )
-            else:
-                has_baseline = False
-                baseline_value = None
-
-        requires_review = refused_count > 0 or (
-            has_baseline
-            and percentage_of_baseline is not None
-            and percentage_of_baseline < 70
-        )
-
-        rows.append(
-            (
-                required_key(
-                    maps["date"], week_start_date, "week-start date"
-                ),
-                required_key(
-                    maps["resident"], resident_id, "resident"
-                ),
-                total_count,
-                accepted_count,
-                refused_count,
-                prn_count,
-                has_baseline,
-                baseline_value,
-                percentage_of_baseline,
-                requires_review,
-                source_file,
-            )
-        )
-
-    return rows
+        return pd.DataFrame(columns=FACT_COLUMNS["fact_medication"])
+    if not medication["medication_status"].isin(["Accepted", "Refused"]).all():
+        raise ValueError("Silver medication_status must be Accepted or Refused")
+    working = medication.assign(
+        accepted=medication["medication_status"].eq("Accepted").astype(int),
+        refused=medication["medication_status"].eq("Refused").astype(int),
+        prn=medication["medication_round"].fillna("").astype(str).str.upper().eq("PRN").astype(int),
+    )
+    weekly = working.groupby(["resident_id", "week_start_date"]).agg(
+        total_dose_count=("medication_status", "size"),
+        accepted_dose_count=("accepted", "sum"),
+        refused_dose_count=("refused", "sum"),
+        prn_dose_count=("prn", "sum"),
+    ).reset_index()
+    weekly = add_dimension_keys(weekly, maps, date_column="week_start_date")
+    weekly = weekly.rename(columns={"date_key": "week_start_date_key"})
+    # These placeholders are refreshed with the full history before commit.
+    weekly["has_baseline"] = False
+    weekly["baseline_median_doses"] = None
+    weekly["percentage_of_baseline"] = None
+    weekly["requires_review"] = weekly["refused_dose_count"].gt(0)
+    return fact_frame(weekly, "fact_medication", source_file)
 
 
-def build_appointment_rows(appointments, maps, source_file):
+def calculate_medication_baselines(history):
+    """Use up to 12 earlier loaded weeks; never include the current/future week."""
+    history = history.sort_values(
+        ["resident_key", "week_start_date_key", "medication_key"]
+    ).copy()
+    # Aggregate same-week batches before rolling so one week is one observation.
+    weekly = history.groupby(["resident_key", "week_start_date_key"], as_index=False).agg(
+        accepted_dose_count=("accepted_dose_count", "sum")
+    ).sort_values(["resident_key", "week_start_date_key"])
+    weekly["baseline_median_doses"] = weekly.groupby("resident_key")[
+        "accepted_dose_count"
+    ].transform(
+        lambda values: values.shift(1).rolling(
+            MEDICATION_BASELINE_MAX_WEEKS,
+            min_periods=MEDICATION_BASELINE_MIN_WEEKS,
+        ).median()
+    ).round(2)
+    history = history.drop(columns=["baseline_median_doses"], errors="ignore").merge(
+        weekly[["resident_key", "week_start_date_key", "baseline_median_doses"]],
+        on=["resident_key", "week_start_date_key"],
+        how="left",
+        validate="many_to_one",
+    )
+    history["has_baseline"] = history["baseline_median_doses"].gt(0)
+    history["baseline_median_doses"] = history["baseline_median_doses"].where(
+        history["has_baseline"]
+    )
+    history["percentage_of_baseline"] = (
+        history["accepted_dose_count"] / history["baseline_median_doses"] * 100
+    ).round(2)
+    history["requires_review"] = history["refused_dose_count"].gt(0) | (
+        history["has_baseline"] & history["percentage_of_baseline"].lt(70)
+    )
+    return history
+
+
+def refresh_medication_baselines(connection, from_week_key):
+    history = read_frame(connection, """
+        SELECT medication_key, week_start_date_key, resident_key,
+               accepted_dose_count, refused_dose_count
+        FROM gold.fact_medication
+    """)
+    if history.empty:
+        return 0
+    refreshed = calculate_medication_baselines(history)
+    refreshed = refreshed.loc[
+        refreshed["week_start_date_key"] >= from_week_key,
+        ["medication_key", "has_baseline", "baseline_median_doses",
+         "percentage_of_baseline", "requires_review"],
+    ]
+    if refreshed.empty:
+        return 0
+    # Update derived values only: preserve later facts' keys, counts and lineage.
+    parameters = [
+        {key: as_database_value(value) for key, value in row.items()}
+        for row in refreshed.to_dict("records")
+    ]
+    connection.execute(text("""
+        UPDATE gold.fact_medication
+        SET has_baseline = :has_baseline,
+            baseline_median_doses = :baseline_median_doses,
+            percentage_of_baseline = :percentage_of_baseline,
+            requires_review = :requires_review
+        WHERE medication_key = :medication_key
+    """), parameters)
+    return len(parameters)
+
+
+def build_appointment_frame(appointments, maps, source_file):
     if appointments.empty:
-        return []
+        return pd.DataFrame(columns=FACT_COLUMNS["fact_appointment"])
 
     appointment_records = []
     for appointment in appointments.itertuples(index=False):
@@ -971,471 +944,146 @@ def build_appointment_rows(appointments, maps, source_file):
             )
         )
 
-    return rows
+    return pd.DataFrame(rows, columns=FACT_COLUMNS["fact_appointment"])
 
 
-def build_incident_rows(incidents, maps, source_file):
-    rows = []
-
-    for incident in incidents.itertuples(index=False):
-        rows.append(
-            (
-                required_key(maps["date"], incident.log_date, "date"),
-                required_key(
-                    maps["resident"], incident.resident_id, "resident"
-                ),
-                required_key(maps["staff"], incident.logged_by, "staff"),
-                clean_text(incident.incident_type),
-                clean_text(incident.incident_detail),
-                incident.log_datetime.to_pydatetime(),
-                incident.shift_type,
-                clean_text(incident.witnessed_by),
-                clean_text(incident.description_clean),
-                as_boolean(incident.bookmark),
-                int(incident.log_event_key),
-                source_file,
-            )
-        )
-
-    return rows
+def build_incident_frame(incidents, maps, source_file):
+    frame = add_dimension_keys(incidents, maps, staff_column="logged_by")
+    frame = frame.rename(columns={
+        "log_datetime": "incident_datetime", "log_event_key": "source_log_event_key",
+        "bookmark": "bookmarked",
+    })
+    for column in ("incident_type", "incident_detail", "witnessed_by", "description_clean"):
+        frame[column] = frame[column].map(clean_text)
+    frame["bookmarked"] = frame["bookmarked"].map(as_boolean)
+    return fact_frame(frame, "fact_incident", source_file)
 
 
-def derive_shift_date(log_datetime, shift_type):
-    log_date = log_datetime.date()
-    if shift_type == "Night" and log_datetime.hour < 8:
-        return log_date - timedelta(days=1)
-    return log_date
+def build_staff_shift_frame(staff_shifts, events, maps, source_file):
+    working = events.copy()
+    dates = working["log_datetime"].dt.normalize()
+    early_night = working["shift_type"].eq("Night") & working["log_datetime"].dt.hour.lt(8)
+    working["shift_date"] = (dates - pd.to_timedelta(early_night.astype(int), unit="D")).dt.date
+    residents = working.groupby(["logged_by", "shift_date", "shift_type"])[
+        "resident_id"
+    ].nunique().rename("resident_count").reset_index().rename(
+        columns={"logged_by": "staff_name"}
+    )
+    shifts = staff_shifts.loc[
+        staff_shifts["staff_name"].isin(maps["support_worker_ids"])
+    ].merge(
+        residents, on=["staff_name", "shift_date", "shift_type"],
+        how="left", validate="many_to_one",
+    )
+    if shifts["resident_count"].fillna(0).lt(1).any():
+        raise ValueError("Could not derive a resident count for a staff shift")
+    shifts["resident_count"] = shifts["resident_count"].astype(int)
+    shifts = add_dimension_keys(shifts, maps, date_column="shift_date", staff_column="staff_name")
+    return fact_frame(shifts, "fact_staff_shift", source_file)
 
 
-def build_staff_shift_rows(staff_shifts, events, maps, source_file):
-    working_events = events.copy()
-    working_events["shift_date"] = working_events.apply(
-        lambda row: derive_shift_date(
-            row["log_datetime"],
-            row["shift_type"],
+def build_staff_involvement_frame(activities, appointments, maps, source_file):
+    activities = activities.loc[
+        activities["staff_involved"].map(as_boolean)
+        & activities["logged_by"].isin(maps["support_worker_ids"])
+    ].copy()
+    activities["involvement_type"] = activities["is_housework"].map(as_boolean).map(
+        {True: "Cleaning Task", False: "Resident Activity"}
+    )
+    activities["involvement_detail"] = activities["activity_type"].map(clean_text)
+    appointments = appointments.loc[
+        appointments["appointment_status"].eq("Completed with Staff")
+        & appointments["logged_by"].isin(maps["support_worker_ids"])
+    ].copy()
+    appointments["involvement_type"] = "Appointment Escort"
+    appointments["involvement_detail"] = appointments["appointment_type"].map(clean_text)
+    columns = ["log_date", "resident_id", "logged_by", "log_event_key",
+               "involvement_type", "involvement_detail"]
+    combined = pd.concat([activities[columns], appointments[columns]], ignore_index=True)
+    combined = add_dimension_keys(combined, maps, staff_column="logged_by")
+    combined = combined.rename(columns={"log_event_key": "source_log_event_key"})
+    return fact_frame(combined, "fact_staff_involvement", source_file)
+
+
+def build_flagged_log_frame(events, maps, source_file):
+    frame = events.loc[events["bookmark"].map(as_boolean)].copy()
+    frame = add_dimension_keys(frame, maps, staff_column="logged_by", log_type=True)
+    frame = frame.rename(columns={
+        "log_event_key": "source_log_event_key", "log_datetime": "logged_at"
+    })
+    for column in ("title", "description_clean"):
+        frame[column] = frame[column].map(clean_text)
+    return fact_frame(frame, "fact_flagged_log", source_file)
+
+
+def build_gold_frames(frames, maps, source_file, week_start_date):
+    return {
+        "agg_log_count_daily": build_log_count_frame(frames["log_event"], maps, source_file),
+        "fact_mood_daily": build_mood_frame(frames["mood"], maps, source_file, week_start_date),
+        "fact_communication": build_communication_frame(
+            frames["communication"], maps, source_file, week_start_date
         ),
-        axis=1,
-    )
-    resident_counts = (
-        working_events.groupby(
-            ["logged_by", "shift_date", "shift_type"]
-        )["resident_id"]
-        .nunique()
-        .to_dict()
-    )
-
-    rows = []
-    for shift in staff_shifts.itertuples(index=False):
-        if shift.staff_name not in maps["support_worker_ids"]:
-            continue
-
-        resident_count = int(
-            resident_counts.get(
-                (shift.staff_name, shift.shift_date, shift.shift_type),
-                0,
-            )
-        )
-        if resident_count < 1:
-            raise ValueError(
-                "Could not derive a resident count for staff shift "
-                f"{shift.staff_name}, {shift.shift_date}, {shift.shift_type}"
-            )
-
-        rows.append(
-            (
-                required_key(maps["date"], shift.shift_date, "shift date"),
-                required_key(maps["staff"], shift.staff_name, "staff"),
-                shift.shift_type,
-                shift.first_log_datetime.to_pydatetime(),
-                shift.last_log_datetime.to_pydatetime(),
-                int(shift.log_count),
-                resident_count,
-                source_file,
-            )
-        )
-
-    return rows
+        "fact_medication": build_medication_frame(frames["medication"], maps, source_file),
+        "fact_appointment": build_appointment_frame(frames["appointment"], maps, source_file),
+        "fact_incident": build_incident_frame(frames["incident"], maps, source_file),
+        "fact_staff_shift": build_staff_shift_frame(
+            frames["staff_shift"], frames["log_event"], maps, source_file
+        ),
+        "fact_staff_involvement": build_staff_involvement_frame(
+            frames["activity"], frames["appointment"], maps, source_file
+        ),
+        "fact_flagged_log": build_flagged_log_frame(frames["log_event"], maps, source_file),
+    }
 
 
-def build_staff_involvement_rows(
-    activities,
-    appointments,
-    maps,
-    source_file,
-):
-    rows = []
-
-    for activity in activities.itertuples(index=False):
-        if not as_boolean(activity.staff_involved):
-            continue
-        if activity.logged_by not in maps["support_worker_ids"]:
-            continue
-
-        involvement_type = (
-            "Cleaning Task"
-            if as_boolean(activity.is_housework)
-            else "Resident Activity"
-        )
-
-        rows.append(
-            (
-                required_key(maps["date"], activity.log_date, "date"),
-                required_key(
-                    maps["resident"], activity.resident_id, "resident"
-                ),
-                required_key(
-                    maps["staff"], activity.logged_by, "staff"
-                ),
-                involvement_type,
-                clean_text(activity.activity_type),
-                int(activity.log_event_key),
-                source_file,
-            )
-        )
-
-    supported_outcomes = appointments[
-        appointments["appointment_status"] == "Completed with Staff"
-    ]
-    for appointment in supported_outcomes.itertuples(index=False):
-        if appointment.logged_by not in maps["support_worker_ids"]:
-            continue
-
-        rows.append(
-            (
-                required_key(maps["date"], appointment.log_date, "date"),
-                required_key(
-                    maps["resident"], appointment.resident_id, "resident"
-                ),
-                required_key(
-                    maps["staff"], appointment.logged_by, "staff"
-                ),
-                "Appointment Escort",
-                clean_text(appointment.appointment_type),
-                int(appointment.log_event_key),
-                source_file,
-            )
-        )
-
-    return rows
-
-
-def build_flagged_log_rows(events, maps, source_file):
-    flagged_events = events[events["bookmark"].map(as_boolean)]
-    rows = []
-
-    for event in flagged_events.itertuples(index=False):
-        rows.append(
-            (
-                required_key(maps["date"], event.log_date, "date"),
-                required_key(
-                    maps["resident"], event.resident_id, "resident"
-                ),
-                required_key(maps["staff"], event.logged_by, "staff"),
-                required_key(
-                    maps["log_type"],
-                    (event.category, event.item),
-                    "log type",
-                ),
-                int(event.log_event_key),
-                event.log_datetime.to_pydatetime(),
-                event.shift_type,
-                clean_text(event.title),
-                clean_text(event.description_clean),
-                source_file,
-            )
-        )
-
-    return rows
-
-
-def insert_rows(cursor, insert_sql, rows):
-    if rows:
-        cursor.executemany(insert_sql, rows)
-    return len(rows)
-
-
-def insert_gold_facts(
-    cursor,
-    frames,
-    maps,
-    source_file,
-    week_start_date,
-):
-    counts = {}
-
-    log_count_rows = build_log_count_rows(
-        frames["log_event"], maps, source_file
-    )
-    counts["agg_log_count_daily"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.agg_log_count_daily (
-            date_key,
-            resident_key,
-            staff_key,
-            log_type_key,
-            shift_type,
-            log_count,
-            bookmarked_log_count,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        log_count_rows,
-    )
-
-    mood_rows = build_mood_rows(
-        frames["mood"],
-        maps,
-        source_file,
-        week_start_date,
-    )
-    counts["fact_mood_daily"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_mood_daily (
-            date_key,
-            resident_key,
-            mood_log_count,
-            expected_log_count,
-            missing_log_count,
-            very_low_count,
-            low_count,
-            okay_count,
-            good_count,
-            very_good_count,
-            average_mood_score,
-            minimum_mood_score,
-            requires_review,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        mood_rows,
-    )
-
-    communication_rows = build_communication_rows(
-        frames["communication"],
-        maps,
-        source_file,
-        week_start_date,
-    )
-    counts["fact_communication"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_communication (
-            date_key,
-            resident_key,
-            day_log_count,
-            night_log_count,
-            total_log_count,
-            expected_log_count,
-            missing_log_count,
-            no_response_count,
-            minimal_count,
-            normal_count,
-            expansive_count,
-            average_communication,
-            requires_review,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        communication_rows,
-    )
-
-    history = fetch_medication_history(cursor, week_start_date)
-    medication_rows = build_medication_rows(
-        frames["medication"],
-        history,
-        maps,
-        source_file,
-    )
-    counts["fact_medication"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_medication (
-            week_start_date_key,
-            resident_key,
-            total_dose_count,
-            accepted_dose_count,
-            refused_dose_count,
-            prn_dose_count,
-            has_baseline,
-            baseline_median_doses,
-            percentage_of_baseline,
-            requires_review,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        medication_rows,
-    )
-
-    appointment_rows = build_appointment_rows(
-        frames["appointment"], maps, source_file
-    )
-    counts["fact_appointment"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_appointment (
-            appointment_date_key,
-            resident_key,
-            appointment_type,
-            appointment_status,
-            scheduled_start_datetime,
-            scheduled_end_datetime,
-            staff_required,
-            completed,
-            has_conflict,
-            source_log_event_key,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        appointment_rows,
-    )
-
-    incident_rows = build_incident_rows(
-        frames["incident"], maps, source_file
-    )
-    counts["fact_incident"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_incident (
-            date_key,
-            resident_key,
-            staff_key,
-            incident_type,
-            incident_detail,
-            incident_datetime,
-            shift_type,
-            witnessed_by,
-            description_clean,
-            bookmarked,
-            source_log_event_key,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        incident_rows,
-    )
-
-    staff_shift_rows = build_staff_shift_rows(
-        frames["staff_shift"],
-        frames["log_event"],
-        maps,
-        source_file,
-    )
-    counts["fact_staff_shift"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_staff_shift (
-            date_key,
-            staff_key,
-            shift_type,
-            first_log_datetime,
-            last_log_datetime,
-            log_count,
-            resident_count,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        staff_shift_rows,
-    )
-
-    involvement_rows = build_staff_involvement_rows(
-        frames["activity"],
-        frames["appointment"],
-        maps,
-        source_file,
-    )
-    counts["fact_staff_involvement"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_staff_involvement (
-            date_key,
-            resident_key,
-            staff_key,
-            involvement_type,
-            involvement_detail,
-            source_log_event_key,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?);
-        """,
-        involvement_rows,
-    )
-
-    flagged_rows = build_flagged_log_rows(
-        frames["log_event"], maps, source_file
-    )
-    counts["fact_flagged_log"] = insert_rows(
-        cursor,
-        """
-        INSERT INTO gold.fact_flagged_log (
-            date_key,
-            resident_key,
-            staff_key,
-            log_type_key,
-            source_log_event_key,
-            logged_at,
-            shift_type,
-            title,
-            description_clean,
-            source_file
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        flagged_rows,
-    )
-
-    return counts
-
-
-def get_dimension_counts(cursor):
-    counts = {}
-    for table_name in (
-        "dim_date",
-        "dim_resident",
-        "dim_staff",
-        "dim_log_type",
-    ):
-        cursor.execute(f"SELECT COUNT(*) FROM gold.{table_name};")
-        counts[table_name] = int(cursor.fetchone()[0])
-    return counts
-
-
-def load_gold_tables(connection, source_file):
+def load_gold_tables(engine, source_file):
+    """Load one file atomically using a SQLAlchemy Engine."""
     source_file = clean_text(source_file)
     if not source_file:
         raise ValueError("source_file is required")
 
-    cursor = connection.cursor()
-    try:
-        seed_dimensions(cursor)
-        maps = load_dimension_maps(cursor)
+    with engine.begin() as connection:
+        # Serialize Gold writers, including dimension seeding and baseline refresh.
+        # Transaction ownership releases the lock on both commit and rollback.
+        if connection.dialect.name == "mssql":
+            connection.execute(text("""
+                IF @@TRANCOUNT = 0 BEGIN TRANSACTION;
+                DECLARE @result int;
+                EXEC @result = sys.sp_getapplock
+                    @Resource = N'care_logs_gold_load',
+                    @LockMode = N'Exclusive',
+                    @LockOwner = N'Transaction',
+                    @LockTimeout = 60000;
+                IF @result < 0
+                    THROW 50001, 'Could not acquire the Gold load lock', 1;
+            """))
 
-        frames = load_silver_frames(cursor, source_file)
+        seed_dimensions(connection)
+        maps = load_dimension_maps(connection)
+        frames = load_silver_frames(connection, source_file)
         week_start_date = validate_silver_source(frames, source_file)
+        gold_frames = build_gold_frames(frames, maps, source_file, week_start_date)
 
-        delete_previous_gold_load(cursor, source_file)
-        gold_counts = insert_gold_facts(
-            cursor,
-            frames,
-            maps,
-            source_file,
-            week_start_date,
-        )
+        previous = read_frame(connection, """
+            SELECT MIN(week_start_date_key) AS first_week
+            FROM gold.fact_medication WHERE source_file = :source_file
+        """, {"source_file": source_file})
+        from_week_key = make_date_key(week_start_date)
+        if pd.notna(previous.iloc[0]["first_week"]):
+            from_week_key = min(from_week_key, int(previous.iloc[0]["first_week"]))
 
-        dimension_counts = get_dimension_counts(cursor)
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        cursor.close()
+        delete_previous_gold_load(connection, source_file)
+        gold_counts = {
+            table: append_frame(connection, table, frame)
+            for table, frame in gold_frames.items()
+        }
+        refreshed_count = refresh_medication_baselines(connection, from_week_key)
+        dimension_counts = {
+            table: int(read_frame(
+                connection, f"SELECT COUNT(*) AS row_count FROM gold.{table}"
+            ).iloc[0]["row_count"])
+            for table in ("dim_date", "dim_resident", "dim_staff", "dim_log_type")
+        }
 
     return {
         "status": "Succeeded",
@@ -1443,4 +1091,5 @@ def load_gold_tables(connection, source_file):
         "week_start_date": week_start_date.isoformat(),
         "dimension_rows": dimension_counts,
         "gold_rows": gold_counts,
+        "medication_baselines_refreshed": refreshed_count,
     }

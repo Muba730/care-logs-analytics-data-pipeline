@@ -5,7 +5,7 @@ import os
 import azure.functions as func
 import mssql_python
 
-from database import get_latest_pipeline_run_key
+from database import create_sqlalchemy_engine, get_latest_pipeline_run_key
 from gold_loader import load_gold_tables
 from silver_loader import (
     load_bronze_to_log_event,
@@ -276,6 +276,7 @@ def load_silver_tables_to_gold(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     connection = None
+    engine = None
 
     try:
         connection = mssql_python.connect(
@@ -300,8 +301,13 @@ def load_silver_tables_to_gold(req: func.HttpRequest) -> func.HttpResponse:
                 409,
             )
 
+        # The audit lookup uses the existing DBAPI helper. End that read before
+        # SQLAlchemy owns the Gold load and its transaction.
+        connection.close()
+        connection = None
+        engine = create_sqlalchemy_engine(connection_string)
         gold_result = load_gold_tables(
-            connection=connection,
+            engine=engine,
             source_file=source_file,
         )
 
@@ -331,3 +337,5 @@ def load_silver_tables_to_gold(req: func.HttpRequest) -> func.HttpResponse:
     finally:
         if connection is not None:
             connection.close()
+        if engine is not None:
+            engine.dispose()
